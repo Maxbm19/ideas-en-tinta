@@ -1,0 +1,529 @@
+---
+title: "AUC-ROC vs AUC-PR vs F1: ¿Qué métrica usar cuando tus clases están desbalanceadas?"
+author: "Ideas en Tinta"
+date: "2026-03-25"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    theme: cosmo
+    fig-width: 9
+    fig-height: 5
+  pdf:
+    toc: true
+jupyter: python3
+execute:
+  warning: false
+  message: false
+---
+
+## Introducción
+
+Cuando entrenamos un modelo de clasificación binaria, la primera métrica que solemos mirar es el **accuracy** (exactitud). Sin embargo, cuando las clases están desbalanceadas —por ejemplo, 99% de transacciones legítimas y 1% de fraudes— un modelo que prediga "legítimo" para todo tendría 99% de accuracy sin detectar ni un solo fraude.
+
+Este artículo analiza tres métricas que sí capturan el rendimiento real en escenarios desbalanceados:
+
+- **AUC-ROC**: Área bajo la curva ROC
+- **AUC-PR**: Área bajo la curva Precision-Recall
+- **F1 Score**: Media armónica de precisión y recall
+
+Usaremos un dataset sintético inspirado en detección de fraude para ilustrar por qué cada métrica cuenta una historia diferente.
+
+---
+
+## Conceptos fundamentales
+
+### La matriz de confusión
+
+Antes de hablar de curvas, es útil recordar los cuatro bloques que las alimentan:
+
+|                    | Predicho Positivo | Predicho Negativo |
+|--------------------|:-----------------:|:-----------------:|
+| **Real Positivo**  | TP (Verdadero +)  | FN (Falso -)      |
+| **Real Negativo**  | FP (Falso +)      | TN (Verdadero -)  |
+
+De aquí derivan todas las métricas:
+
+$$\text{Recall (Sensibilidad)} = \frac{TP}{TP + FN}$$
+
+$$\text{Precisión} = \frac{TP}{TP + FP}$$
+
+$$\text{FPR (False Positive Rate)} = \frac{FP}{FP + TN}$$
+
+### AUC-ROC
+
+La curva **ROC** enfrenta TPR (Recall) contra FPR a distintos umbrales de clasificación.
+
+$$\text{TPR} = \frac{TP}{TP + FN}, \quad \text{FPR} = \frac{FP}{FP + TN}$$
+
+El **AUC-ROC** es el área bajo esa curva. Tiene una interpretación probabilística elegante:
+
+> Es la probabilidad de que, dado un positivo y un negativo al azar, el modelo asigne mayor score al positivo.
+
+**El problema con clases desbalanceadas:** El FPR incluye TN en el denominador. Cuando hay muchos negativos, el FPR permanece artificialmente bajo incluso con muchos falsos positivos. Esto hace que la curva ROC se vea optimista cuando en realidad el modelo falla en detectar la clase minoritaria.
+
+### AUC-PR
+
+La curva **PR** enfrenta Precisión contra Recall a distintos umbrales.
+
+$$\text{Precisión} = \frac{TP}{TP + FP}, \quad \text{Recall} = \frac{TP}{TP + FN}$$
+
+La ventaja clave: **no usa TN**. En escenarios muy desbalanceados, esto significa que el rendimiento sobre la clase minoritaria no puede inflarse artificialmente.
+
+El baseline de un clasificador aleatorio en PR-AUC es la prevalencia de la clase positiva (por ejemplo, 0.01 para un 1% de positivos), no 0.5 como en ROC. Esto hace la métrica más exigente y honesta.
+
+### F1 Score
+
+El **F1** es la media armónica entre precisión y recall:
+
+$$F1 = 2 \cdot \frac{\text{Precisión} \times \text{Recall}}{\text{Precisión} + \text{Recall}} = \frac{2 \cdot TP}{2 \cdot TP + FP + FN}$$
+
+Es una métrica a **umbral fijo** (normalmente 0.5), lo que la hace práctica pero menos completa que las curvas. Para datos desbalanceados se prefiere calcular por clase y promediar (macro o weighted).
+
+---
+
+## Preparación del entorno
+
+```{python}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from sklearn.datasets import make_classification
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    roc_auc_score, roc_curve,
+    precision_recall_curve, average_precision_score,
+    f1_score, classification_report,
+    confusion_matrix, ConfusionMatrixDisplay
+)
+
+np.random.seed(42)
+plt.rcParams.update({
+    "figure.dpi": 120,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "font.family": "sans-serif",
+})
+```
+
+---
+
+## Dataset sintético: detección de fraude
+
+Generamos un dataset con 10,000 muestras y un desbalance 50:1 (aproximadamente 2% de fraudes), similar al dataset real de tarjetas de crédito de Kaggle.
+
+```{python}
+X, y = make_classification(
+    n_samples=10_000,
+    n_features=20,
+    n_informative=10,
+    n_redundant=5,
+    weights=[0.98, 0.02],   # 98% legítimos, 2% fraudes
+    flip_y=0.01,
+    random_state=42,
+)
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.3, stratify=y, random_state=42
+)
+
+total = len(y)
+n_pos = y.sum()
+n_neg = total - n_pos
+
+print(f"Total muestras : {total:,}")
+print(f"Clase 0 (legítimo): {n_neg:,}  ({n_neg/total:.1%})")
+print(f"Clase 1 (fraude)  : {n_pos:,}   ({n_pos/total:.1%})")
+print(f"Ratio de desbalance: {n_neg/n_pos:.0f}:1")
+```
+
+---
+
+## Entrenamiento de modelos
+
+Entrenamos tres modelos distintos para comparar cómo las métricas los diferencian:
+
+1. **Regresión Logística** — modelo base, calibrado
+2. **Random Forest** — más potente, potencialmente mejor en la minoría
+3. **Clasificador "optimista"** — un modelo que siempre predice alta probabilidad (simula el problema de accuracy alto pero métricas de minoría malas)
+
+```{python}
+# Modelo 1: Regresión Logística
+lr = LogisticRegression(class_weight="balanced", max_iter=1000, random_state=42)
+lr.fit(X_train, y_train)
+lr_proba = lr.predict_proba(X_test)[:, 1]
+
+# Modelo 2: Random Forest
+rf = RandomForestClassifier(n_estimators=200, class_weight="balanced", random_state=42)
+rf.fit(X_train, y_train)
+rf_proba = rf.predict_proba(X_test)[:, 1]
+
+# Modelo 3: "Ingenuo" — siempre predice probabilidad proporcional a la clase mayoritaria
+# Simula un clasificador que aprende la distribución pero ignora patrones
+naive_proba = np.full(len(y_test), y_train.mean()) + np.random.normal(0, 0.05, len(y_test))
+naive_proba = np.clip(naive_proba, 0, 1)
+
+models = {
+    "Regresión Logística": lr_proba,
+    "Random Forest": rf_proba,
+    "Clasificador Ingenuo": naive_proba,
+}
+```
+
+---
+
+## Comparación de métricas en tabla
+
+```{python}
+rows = []
+for name, proba in models.items():
+    preds = (proba >= 0.5).astype(int)
+    rows.append({
+        "Modelo": name,
+        "Accuracy": f"{(preds == y_test).mean():.3f}",
+        "AUC-ROC": f"{roc_auc_score(y_test, proba):.3f}",
+        "AUC-PR": f"{average_precision_score(y_test, proba):.3f}",
+        "F1 (macro)": f"{f1_score(y_test, preds, average='macro'):.3f}",
+        "F1 fraude": f"{f1_score(y_test, preds, average=None)[1]:.3f}",
+    })
+
+df_results = pd.DataFrame(rows)
+df_results
+```
+
+::: {.callout-important}
+**Observa el "Clasificador Ingenuo"**: tiene accuracy alto (~98%) porque simplemente predice siempre la clase mayoritaria, pero su AUC-PR y F1 en la clase fraude lo delatan.
+:::
+
+---
+
+## Visualización de curvas
+
+### Curva ROC
+
+```{python}
+#| fig-width: 6.5
+#| fig-height: 4.5
+colors = ["#2563EB", "#16A34A", "#DC2626"]
+
+fig, ax = plt.subplots(figsize=(6.5, 4.5))
+
+for (name, proba), color in zip(models.items(), colors):
+    fpr, tpr, _ = roc_curve(y_test, proba)
+    auc_val = roc_auc_score(y_test, proba)
+    ax.plot(fpr, tpr, color=color, lw=2.5, label=f"{name}  (AUC = {auc_val:.3f})")
+
+ax.plot([0, 1], [0, 1], "k--", lw=1.2, label="Clasificador aleatorio  (AUC = 0.5)")
+ax.fill_between([0, 1], [0, 1], alpha=0.04, color="grey")
+ax.set_xlabel("False Positive Rate (FPR)", fontsize=11)
+ax.set_ylabel("True Positive Rate (Recall)", fontsize=11)
+ax.set_title("Curva ROC — los tres modelos parecen competitivos", fontsize=12)
+ax.legend(fontsize=9, loc="lower right")
+ax.set_xlim([0, 1])
+ax.set_ylim([0, 1.02])
+plt.tight_layout()
+plt.show()
+```
+
+### Curva Precision-Recall
+
+```{python}
+#| fig-width: 6.5
+#| fig-height: 4.5
+fig, ax = plt.subplots(figsize=(6.5, 4.5))
+baseline = y_test.mean()
+
+for (name, proba), color in zip(models.items(), colors):
+    precision, recall, _ = precision_recall_curve(y_test, proba)
+    ap = average_precision_score(y_test, proba)
+    ax.plot(recall, precision, color=color, lw=2.5, label=f"{name}  (AP = {ap:.3f})")
+
+ax.axhline(baseline, color="black", linestyle="--", lw=1.5,
+           label=f"Baseline aleatorio  ({baseline:.3f})")
+ax.fill_between([0, 1], baseline, alpha=0.06, color="grey")
+ax.set_xlabel("Recall", fontsize=11)
+ax.set_ylabel("Precisión", fontsize=11)
+ax.set_title("Curva Precision-Recall — el clasificador ingenuo queda al descubierto", fontsize=12)
+ax.legend(fontsize=9, loc="upper right")
+ax.set_xlim([0, 1])
+ax.set_ylim([0, 1.02])
+plt.tight_layout()
+plt.show()
+```
+
+::: {.callout-note}
+**¿Ves la diferencia?** En la curva ROC los tres modelos parecen separarse razonablemente bien. En la curva PR el clasificador ingenuo colapsa hacia el baseline, revelando que no detecta fraudes en absoluto. La curva PR no puede inflarse con los miles de verdaderos negativos.
+:::
+
+---
+
+## ¿Por qué ROC puede engañar con datos desbalanceados?
+
+Simulemos explícitamente el efecto con cuatro niveles de desbalance (1:1, 5:1, 20:1 y 100:1), entrenando el mismo modelo en cada caso.
+
+```{python}
+# Generar datos y entrenar modelos para cada ratio
+ratios = [1, 5, 20, 100]
+sim_results = []
+
+for ratio in ratios:
+    n_pos_sim = 200
+    n_neg_sim = n_pos_sim * ratio
+    X_sim, y_sim = make_classification(
+        n_samples=n_pos_sim + n_neg_sim,
+        n_features=10, n_informative=5,
+        weights=[n_neg_sim / (n_pos_sim + n_neg_sim), n_pos_sim / (n_pos_sim + n_neg_sim)],
+        random_state=42,
+    )
+    Xtr, Xte, ytr, yte = train_test_split(X_sim, y_sim, test_size=0.3, stratify=y_sim, random_state=42)
+    clf = RandomForestClassifier(n_estimators=100, random_state=42)
+    clf.fit(Xtr, ytr)
+    proba_sim = clf.predict_proba(Xte)[:, 1]
+    sim_results.append((ratio, yte, proba_sim))
+```
+
+### ROC a distintos niveles de desbalance
+
+```{python}
+#| fig-width: 6.5
+#| fig-height: 7
+fig, axes = plt.subplots(2, 2, figsize=(6.5, 7))
+
+for ax, (ratio, yte, proba_sim) in zip(axes.flat, sim_results):
+    fpr, tpr, _ = roc_curve(yte, proba_sim)
+    auc_roc = roc_auc_score(yte, proba_sim)
+    ax.plot(fpr, tpr, "#2563EB", lw=2.5)
+    ax.plot([0, 1], [0, 1], "k--", lw=1)
+    ax.fill_between(fpr, tpr, alpha=0.12, color="#2563EB")
+    ax.set_title(f"Ratio {ratio}:1  —  ROC AUC = {auc_roc:.2f}", fontsize=9)
+    ax.set_xlabel("FPR", fontsize=9)
+    ax.set_ylabel("TPR (Recall)", fontsize=9)
+    ax.set_xlim([0, 1]); ax.set_ylim([0, 1.02])
+
+fig.suptitle("Curva ROC — el AUC apenas baja aunque el desbalance se dispare", fontsize=10)
+plt.tight_layout()
+plt.show()
+```
+
+### PR a distintos niveles de desbalance
+
+```{python}
+#| fig-width: 6.5
+#| fig-height: 7
+fig, axes = plt.subplots(2, 2, figsize=(6.5, 7))
+
+for ax, (ratio, yte, proba_sim) in zip(axes.flat, sim_results):
+    prec, rec, _ = precision_recall_curve(yte, proba_sim)
+    ap = average_precision_score(yte, proba_sim)
+    baseline_sim = yte.mean()
+    ax.plot(rec, prec, "#16A34A", lw=2.5)
+    ax.axhline(baseline_sim, color="black", linestyle="--", lw=1.2)
+    ax.fill_between(rec, 0, prec, alpha=0.15, color="#16A34A")
+    ax.set_title(f"Ratio {ratio}:1  —  AP = {ap:.2f}  |  base = {baseline_sim:.3f}", fontsize=9)
+    ax.set_xlabel("Recall", fontsize=9)
+    ax.set_ylabel("Precisión", fontsize=9)
+    ax.set_xlim([0, 1]); ax.set_ylim([0, 1.02])
+
+fig.suptitle("Curva PR — el AUC cae drásticamente y el baseline también se mueve", fontsize=10)
+plt.tight_layout()
+plt.show()
+```
+
+A medida que el ratio de desbalance aumenta:
+
+- **ROC-AUC** permanece artificialmente alto (aparenta buen rendimiento porque el FPR usa los abundantes TN)
+- **PR-AUC** cae notablemente y su baseline también se desplaza hacia abajo, revelando cuánto cuesta detectar la clase rara
+
+---
+
+## El umbral como palanca: optimizar la métrica que importa
+
+AUC-ROC y AUC-PR son métricas **independientes del umbral** — resumen el rendimiento a lo largo de todos los puntos de corte posibles. Pero en producción siempre hay que elegir **un umbral concreto**.
+
+La pregunta clave es: ¿qué métrica quieres maximizar? La respuesta depende del negocio:
+
+- **Maximizar Recall** → no perder ningún fraude (aunque generes falsas alarmas)
+- **Maximizar Precisión** → solo alertar cuando estés muy seguro (aunque pierdas algunos fraudes)
+- **Maximizar F1** → equilibrio entre ambos
+
+El siguiente gráfico muestra, para el modelo Random Forest, cómo evolucionan Precisión, Recall y F1 al barrer todos los umbrales posibles. Las líneas verticales marcan el umbral óptimo para cada métrica.
+
+```{python}
+#| fig-width: 6.5
+#| fig-height: 4.5
+thresholds = np.linspace(0.005, 0.995, 400)
+
+precisions, recalls, f1s = [], [], []
+for t in thresholds:
+    preds_t = (rf_proba >= t).astype(int)
+    precisions.append(f1_score(y_test, preds_t, pos_label=1, average=None, zero_division=0)[1]
+                      if preds_t.sum() > 0 else 0)
+    recalls.append(f1_score(y_test, preds_t, pos_label=1, average=None, zero_division=0)[0]
+                   if True else 0)
+    f1s.append(f1_score(y_test, preds_t, average="binary", zero_division=0))
+
+# Recalcular correctamente con sklearn precision/recall directo
+from sklearn.metrics import precision_score, recall_score
+precisions, recalls, f1s = [], [], []
+for t in thresholds:
+    preds_t = (rf_proba >= t).astype(int)
+    precisions.append(precision_score(y_test, preds_t, zero_division=0))
+    recalls.append(recall_score(y_test, preds_t, zero_division=0))
+    f1s.append(f1_score(y_test, preds_t, zero_division=0))
+
+precisions = np.array(precisions)
+recalls    = np.array(recalls)
+f1s        = np.array(f1s)
+
+# Umbrales óptimos
+t_best_f1   = thresholds[np.argmax(f1s)]
+t_best_rec  = thresholds[np.argmax(recalls >= 0.90)]   # primer umbral con recall >= 90%
+t_best_prec = thresholds[np.argmax(precisions >= 0.80)] # primer umbral con precision >= 80%
+
+fig, ax = plt.subplots(figsize=(6.5, 4.5))
+
+ax.plot(thresholds, precisions, color="#DC2626", lw=2.5, label="Precisión")
+ax.plot(thresholds, recalls,    color="#2563EB", lw=2.5, label="Recall")
+ax.plot(thresholds, f1s,        color="#7C3AED", lw=2.5, label="F1 Score")
+
+# Marcadores de óptimos
+opts = [
+    (t_best_f1,   f1s[np.argmax(f1s)],          "#7C3AED", "F1 máx",       "top"),
+    (t_best_rec,  recalls[np.argmax(recalls >= 0.90)], "#2563EB", "Recall ≥ 0.90", "bottom"),
+    (t_best_prec, precisions[np.argmax(precisions >= 0.80)], "#DC2626", "Prec ≥ 0.80", "top"),
+]
+
+for t_opt, val, color, label, va in opts:
+    ax.axvline(t_opt, color=color, linestyle="--", lw=1.5, alpha=0.7)
+    ax.scatter([t_opt], [val], color=color, s=80, zorder=5)
+    ax.annotate(
+        f"{label}\nt={t_opt:.2f}",
+        xy=(t_opt, val), xytext=(t_opt + 0.03, val + (0.05 if va == "top" else -0.1)),
+        fontsize=8, color=color,
+        arrowprops=dict(arrowstyle="->", color=color, lw=1),
+    )
+
+ax.axvline(0.5, color="grey", linestyle=":", lw=1.2, alpha=0.6)
+ax.text(0.51, 0.05, "umbral\ndefault 0.5", fontsize=7.5, color="grey")
+
+ax.set_xlabel("Umbral de clasificación", fontsize=11)
+ax.set_ylabel("Valor de la métrica", fontsize=11)
+ax.set_title("Precisión, Recall y F1 en función del umbral — Random Forest", fontsize=12)
+ax.legend(fontsize=10, loc="center right")
+ax.set_xlim([0, 1])
+ax.set_ylim([0, 1.05])
+plt.tight_layout()
+plt.show()
+```
+
+::: {.callout-tip}
+**¿Cómo leer este gráfico?**
+
+- **Recall** (azul) decrece monotónicamente: umbrales bajos capturan más fraudes pero con mucho ruido.
+- **Precisión** (rojo) crece con el umbral: al exigir más confianza, cuando alertas casi siempre aciertas, pero te pierdes muchos fraudes.
+- **F1** (violeta) tiene un máximo claro: es el punto de equilibrio entre los dos.
+
+El umbral por defecto (0.5) raramente es el óptimo en datasets desbalanceados.
+:::
+
+```{python}
+# Resumen numérico en los tres umbrales óptimos
+rows_thresh = []
+for t_opt, label in [(t_best_f1, "Máx F1"), (t_best_rec, "Recall ≥ 0.90"), (t_best_prec, "Prec ≥ 0.80"), (0.5, "Default 0.5")]:
+    preds_t = (rf_proba >= t_opt).astype(int)
+    rows_thresh.append({
+        "Criterio": label,
+        "Umbral": f"{t_opt:.3f}",
+        "Precisión": f"{precision_score(y_test, preds_t, zero_division=0):.3f}",
+        "Recall":    f"{recall_score(y_test, preds_t, zero_division=0):.3f}",
+        "F1":        f"{f1_score(y_test, preds_t, zero_division=0):.3f}",
+    })
+pd.DataFrame(rows_thresh)
+```
+
+```{python}
+# Matriz de confusión con el umbral F1-óptimo
+rf_preds_opt = (rf_proba >= t_best_f1).astype(int)
+fig, axes = plt.subplots(2, 1, figsize=(5, 8))
+
+for ax, (t, title) in zip(axes, [(0.5, "Umbral default (0.5)"), (t_best_f1, f"Umbral F1-óptimo ({t_best_f1:.2f})")]):
+    preds_t = (rf_proba >= t).astype(int)
+    cm = confusion_matrix(y_test, preds_t)
+    ConfusionMatrixDisplay(cm, display_labels=["Legítimo", "Fraude"]).plot(
+        ax=ax, colorbar=False, cmap="Blues"
+    )
+    ax.set_title(title, fontsize=11)
+
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## Guía de decisión: ¿cuál métrica usar?
+
+```{python}
+#| echo: false
+decision_data = {
+    "Situación": [
+        "Clases balanceadas (<4:1)",
+        "Desbalance moderado (4-10:1)",
+        "Desbalance severo (>10:1)",
+        "Costo alto de falsos positivos",
+        "Costo alto de falsos negativos",
+        "Necesitas un solo número",
+        "Optimización de hiperparámetros",
+        "Producción en tiempo real",
+    ],
+    "Métrica recomendada": [
+        "AUC-ROC",
+        "AUC-ROC + AUC-PR",
+        "AUC-PR",
+        "Precisión / AUC-PR",
+        "Recall / AUC-PR",
+        "F1 (macro o weighted)",
+        "AUC-PR o F1",
+        "F1 o Precision@K",
+    ],
+    "Razón": [
+        "TN abundantes no distorsionan el FPR",
+        "Ambas dan perspectiva complementaria",
+        "ROC infla el rendimiento real",
+        "AUC-PR castiga FP sin contar TN",
+        "Recall nunca ignora FN",
+        "Resumen compacto de precisión y recall",
+        "Diferenciación clara entre modelos",
+        "Umbral explícito y controlable",
+    ],
+}
+pd.DataFrame(decision_data)
+```
+
+---
+
+## Resumen
+
+| Métrica | Qué mide | Incluye TN | Fiable con desbalance |
+|---------|----------|:----------:|:---------------------:|
+| AUC-ROC | TPR vs FPR en todos los umbrales | Sí | No (puede inflar) |
+| AUC-PR  | Precisión vs Recall en todos los umbrales | No | Sí |
+| F1      | Precisión y Recall en un umbral fijo | No | Sí (con cuidado) |
+
+**Regla práctica:**
+
+> Si tu dataset tiene más de 10:1 de desbalance, reporta siempre **AUC-PR**. Si puedes, muestra también el **F1 óptimo** (ajustando el umbral) y explica el tradeoff precisión-recall al stakeholder.
+
+---
+
+## Referencias
+
+Para profundizar en los temas cubiertos aquí, consulta el archivo [`referencias.md`](referencias.md) con todos los links organizados por categoría.
+
+El paper más citado en este tema es:
+
+> Saito, T. & Rehmsmeier, M. (2015). *The Precision-Recall Plot Is More Informative than the ROC Plot When Evaluating Binary Classifiers on Imbalanced Datasets.* PLOS ONE, 10(3), e0118432.
