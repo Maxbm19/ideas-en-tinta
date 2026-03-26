@@ -16,6 +16,7 @@
 
 ## Blogs y guías técnicas
 
+- [ROC vs PRC](https://beverly-wang0005.medium.com/roc-vs-prc-6cd30d287a4b) — Beverly Wang, Medium: explicación accesible de por qué ROC no es apropiada para datos muy desbalanceados y cuándo combinar PRC con F1 y Cohen's Kappa.
 - [ROC AUC vs Precision-Recall for Imbalanced Data](https://machinelearningmastery.com/roc-auc-vs-precision-recall-for-imbalanced-data/) — MachineLearningMastery: comparación práctica con código.
 - [How and Why I Switched from ROC to PR Curve](https://juandelacalle.medium.com/how-and-why-i-switched-from-the-roc-curve-to-the-precision-recall-curve-to-analyze-my-imbalanced-6171da91c6b8) — Medium: experiencia práctica en producción.
 - [Precision-Recall Curve, a Different View](https://sinyi-chou.github.io/classification-pr-curve/) — Sin Yi Chou: visualizaciones detalladas.
