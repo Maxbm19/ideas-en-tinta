@@ -22,11 +22,13 @@ execute:
 
 ## Introducción
 
-Cuando entrenamos un modelo de clasificación binaria, una de las métricas más usadas para evaluar su rendimiento es el **AUC-ROC** (Area Under the ROC Curve). Y tiene buenas razones para serlo: a diferencia de métricas como la precisión, el recall o el accuracy, el AUC-ROC no depende de elegir un umbral de probabilidad — resume el comportamiento del modelo en todos los puntos de corte posibles. Un solo número que permite comparar modelos sin tener que comprometerse con ninguna decisión arbitraria de corte.
+Tu modelo de detección de fraude tiene AUC-ROC de 0.95. Lo llevás a producción y resulta que 4 de cada 5 alertas son falsas. ¿Qué pasó?
 
-El problema aparece cuando nos enfrentamos a clases desbalanceadas, es decir, cuando la clase que nos interesa predecir es muy minoritaria respecto a la otra. Esto es más común de lo que parece: modelos de churn donde solo el 5% de los usuarios se retiran, diagnóstico de una enfermedad poco frecuente donde los casos positivos son el 8%, o clasificación de transacciones fraudulentas donde menos del 2% son maliciosas. En todos estos casos, el AUC-ROC tiende a ser optimista — puede hacernos creer que el modelo funciona bien cuando en realidad está fallando justo en lo que importa.
+Lo que pasó es que el AUC-ROC estaba siendo optimista. Y tiene sentido que lo sea: es una métrica diseñada para medir qué tan bien el modelo separa las dos distribuciones de scores, sin importar cuántos ejemplos hay de cada clase. A diferencia del accuracy, la precisión o el recall, el AUC-ROC no depende de elegir un umbral — resume el comportamiento del modelo en todos los puntos de corte posibles. Un solo número que permite comparar modelos sin comprometerse con ninguna decisión arbitraria de corte.
 
-¿Qué métricas sí capturan esto? Las alternativas que no son afectadas por la clase mayoritaria son las que se centran en la fracción de verdaderos positivos dentro de las predicciones positivas: el **AUC-PR** (Area Under the Precision-Recall Curve) y el **F1 Score**. Acá les voy a mostrar cómo se comportan las tres en un escenario de clasificación de fraude, por qué cuentan historias distintas, y cuándo conviene usar cada una.
+El problema aparece cuando las clases están muy desbalanceadas: modelos de churn donde solo el 5% de los usuarios se retiran, diagnóstico de una enfermedad poco frecuente donde los casos positivos son el 8%, o clasificación de transacciones fraudulentas donde menos del 2% son maliciosas. En esos casos el AUC-ROC puede pintarte una imagen rosada de un modelo que en la práctica está fallando justo en lo que importa.
+
+¿Qué métricas sí capturan esto? Las que se centran en la fracción de verdaderos positivos dentro de las predicciones positivas, sin que la clase mayoritaria pueda distorsionar el resultado: el **AUC-PR** (Area Under the Precision-Recall Curve) y el **F1 Score**. Acá les voy a mostrar cómo se comportan las tres en un escenario de clasificación de fraude, por qué cuentan historias distintas, y cuándo conviene usar cada una.
 
 ---
 
@@ -120,9 +122,13 @@ $$\text{Precisión (PPV - Positive Predictive Value)} = \frac{TP}{TP + FP}$$
 
 La relación entre los verdaderos positivos y todas las predicciones positivas que realizaste.
 
+$$\text{Especificidad (TNR - True Negative Rate)} = \frac{TN}{TN + FP}$$
+
+La tasa de acierto sobre los negativos reales — qué proporción de las transacciones legítimas el modelo descartó correctamente.
+
 $$\text{FPR (False Positive Rate)} = \frac{FP}{FP + TN}$$
 
-La relación entre los falsos positivos y todos los negativos reales — qué proporción de la clase negativa el modelo clasificó incorrectamente como positiva.
+La relación entre los falsos positivos y todos los negativos reales. Notar que **FPR = 1 − Especificidad**: el eje X de la curva ROC mide exactamente qué tan lejos está el modelo de clasificar perfectamente los negativos.
 
 ### AUC-ROC
 
@@ -215,23 +221,24 @@ Entrenamos tres modelos distintos para comparar cómo las métricas los diferenc
 
 1. **Regresión Logística** — modelo base, calibrado
 2. **Random Forest** — más potente, potencialmente mejor en la minoría
-3. **Clasificador Ingenuo** — un modelo que siempre predice la probabilidad base de la clase mayoritaria (simula el problema de accuracy alto pero métricas de minoría malas)
+3. **Clasificador Ingenuo** — una regresión logística entrenada sin corrección de desbalance. Con datos 41:1, el modelo aprende a decir "casi todo es legítimo". Accuracy alto, AUC-ROC decente porque aprendió los features, pero AUC-PR terrible porque casi nunca predice fraude.
 
 ```{python}
-# Modelo 1: Regresión Logística
+# Modelo 1: Regresión Logística (con corrección de desbalance)
 lr = LogisticRegression(class_weight="balanced", max_iter=1000, random_state=42)
 lr.fit(X_train, y_train)
 lr_proba = lr.predict_proba(X_test)[:, 1]
 
-# Modelo 2: Random Forest
+# Modelo 2: Random Forest (con corrección de desbalance)
 rf = RandomForestClassifier(n_estimators=200, class_weight="balanced", random_state=42)
 rf.fit(X_train, y_train)
 rf_proba = rf.predict_proba(X_test)[:, 1]
 
-# Modelo 3: "Ingenuo" — siempre predice probabilidad proporcional a la clase mayoritaria
-# Simula un clasificador que aprende la distribución pero ignora patrones
-naive_proba = np.full(len(y_test), y_train.mean()) + np.random.normal(0, 0.05, len(y_test))
-naive_proba = np.clip(naive_proba, 0, 1)
+# Modelo 3: Logística SIN corrección — sesgado hacia la clase mayoritaria
+# Aprende los features pero casi nunca predice fraude: AUC-ROC decente, AUC-PR terrible
+lr_naive = LogisticRegression(max_iter=1000, random_state=42)
+lr_naive.fit(X_train, y_train)
+naive_proba = lr_naive.predict_proba(X_test)[:, 1]
 
 models = {
     "Regresión Logística": lr_proba,
@@ -326,37 +333,59 @@ plt.show()
 
 ---
 
-## ¿Por qué ROC puede engañar con datos desbalanceados?
+## ¿Por qué la ROC es optimista con datos desbalanceados?
+
+La ROC no está rota. Responde correctamente a su pregunta: *¿qué tan bien separa el modelo las distribuciones de scores de positivos y negativos?* El problema es que en escenarios desbalanceados esa no es la pregunta que importa. Lo que importa es: *cuando el modelo dice fraude, ¿puedo confiarle?* — y eso lo responde la curva PR.
+
+### El experimento mental
+
+Pensá en un modelo fijo con estos resultados: TP = 800, FN = 200, FP = 200. El modelo no cambia. Lo único que varía es cuántas transacciones legítimas hay en el dataset.
+
+| Escenario | Negativos | FPR | Precisión |
+|-----------|-----------|-----|-----------|
+| Balanceado (1:1) | 1.000 | 200/1.000 = **20%** | 800/1.000 = **80%** |
+| Desbalanceado (99:1) | 99.000 | 200/99.000 = **0.2%** | 800/1.000 = **80%** |
+
+El modelo no mejoró. Comete exactamente los mismos errores. Pero la curva ROC cuenta dos historias completamente distintas — pasó de un FPR de 20% a uno de 0.2% — mientras que la Precisión se mantiene igual en ambos casos.
+
+### La variable que hace la diferencia: TN
+
+La diferencia está en una sola variable:
+
+- **ROC** usa $\text{FPR} = \frac{FP}{FP + TN}$. Cuando TN es masivo, los FP se diluyen y el FPR cae aunque los errores sean los mismos.
+- **PR** usa $\text{Precisión} = \frac{TP}{TP + FP}$. TN no aparece en ningún lado. No hay donde esconder errores.
 
 ::: {.callout-note}
-**El FPR se atenúa con la cantidad de negativos.** Como el denominador del FPR incluye todos los verdaderos negativos, cuando la clase negativa es enorme el modelo puede generar muchos falsos positivos sin que el FPR suba demasiado. La curva ROC ve eso como buen rendimiento — aunque en la práctica el modelo esté fallando justo en lo que importa.
+La ROC le da crédito al modelo por los negativos que clasificó bien — que en un dataset desbalanceado es "crédito fácil". La mayoría de esas transacciones legítimas ni se parecen a un fraude, así que descartarlas bien no dice mucho sobre la calidad del modelo.
 :::
 
-La razón es mecánica: el FPR usa los verdaderos negativos en el denominador. Cuando la clase negativa es enorme, el modelo puede generar muchos falsos positivos sin que el FPR suba demasiado — y la curva ROC no se entera.
+### El baseline también miente... pero solo en ROC
 
-Un ejemplo concreto: imaginá un dataset con 100 fraudes y 99.900 transacciones legítimas. Si el modelo genera 500 falsos positivos, eso es catastrófico en la práctica — por cada fraude detectado hay 5 alertas falsas. Pero el FPR es solo 500/99.900 ≈ 0.5%. La curva ROC ve eso como un rendimiento excelente.
+En la curva ROC, el baseline de un clasificador aleatorio siempre es AUC = 0.5, sin importar el desbalance. La ROC no se entera de que el problema se volvió más difícil.
 
-Para ver este efecto en la práctica, simulemos el mismo modelo entrenado con cuatro niveles de desbalance distintos (1:1, 5:1, 20:1 y 100:1).
+En la curva PR, el baseline es la prevalencia de la clase positiva. Con 2% de fraudes, un clasificador aleatorio tiene AUC-PR ≈ 0.02. La PR se recalibra automáticamente a la dificultad real del problema. Un AUC-PR de 0.40 con 2% de positivos es genuinamente bueno. La ROC no te obliga a comparar contra esa referencia honesta.
+
+### Simulación con modelo fijo
+
+Para verlo sin ambigüedad, usamos scores sintéticos fijos — el modelo no cambia, solo varía la cantidad de negativos:
 
 ```{python}
-# Generar datos y entrenar modelos para cada ratio
+# Scores fijos: 1.000 positivos siempre iguales
+# Solo varía cuántos negativos hay
+np.random.seed(42)
+n_pos_sim = 1000
+scores_pos = np.random.beta(5, 2, n_pos_sim)        # scores altos (positivos)
+scores_neg_pool = np.random.beta(2, 5, 100_000)      # pool de negativos con scores bajos
+
 ratios = [1, 5, 20, 100]
 sim_results = []
 
 for ratio in ratios:
-    n_pos_sim = 200
     n_neg_sim = n_pos_sim * ratio
-    X_sim, y_sim = make_classification(
-        n_samples=n_pos_sim + n_neg_sim,
-        n_features=10, n_informative=5,
-        weights=[n_neg_sim / (n_pos_sim + n_neg_sim), n_pos_sim / (n_pos_sim + n_neg_sim)],
-        random_state=42,
-    )
-    Xtr, Xte, ytr, yte = train_test_split(X_sim, y_sim, test_size=0.3, stratify=y_sim, random_state=42)
-    clf = RandomForestClassifier(n_estimators=100, random_state=42)
-    clf.fit(Xtr, ytr)
-    proba_sim = clf.predict_proba(Xte)[:, 1]
-    sim_results.append((ratio, yte, proba_sim))
+    scores_neg = scores_neg_pool[:n_neg_sim]
+    y_sim = np.concatenate([np.ones(n_pos_sim), np.zeros(n_neg_sim)])
+    s_sim = np.concatenate([scores_pos, scores_neg])
+    sim_results.append((ratio, y_sim, s_sim))
 ```
 
 ### ROC a distintos niveles de desbalance
@@ -366,9 +395,9 @@ for ratio in ratios:
 #| fig-height: 7
 fig, axes = plt.subplots(2, 2, figsize=(6.5, 7))
 
-for ax, (ratio, yte, proba_sim) in zip(axes.flat, sim_results):
-    fpr, tpr, _ = roc_curve(yte, proba_sim)
-    auc_roc = roc_auc_score(yte, proba_sim)
+for ax, (ratio, y_sim, s_sim) in zip(axes.flat, sim_results):
+    fpr, tpr, _ = roc_curve(y_sim, s_sim)
+    auc_roc = roc_auc_score(y_sim, s_sim)
     ax.plot(fpr, tpr, "#2563EB", lw=2.5)
     ax.plot([0, 1], [0, 1], "k--", lw=1)
     ax.fill_between(fpr, tpr, alpha=0.12, color="#2563EB")
@@ -377,10 +406,12 @@ for ax, (ratio, yte, proba_sim) in zip(axes.flat, sim_results):
     ax.set_ylabel("TPR (Recall)", fontsize=9)
     ax.set_xlim([0, 1]); ax.set_ylim([0, 1.02])
 
-fig.suptitle("Curva ROC — el AUC apenas baja aunque el desbalance se dispare", fontsize=10)
+fig.suptitle("Curva ROC — el mismo modelo, el AUC sube con el desbalance", fontsize=10)
 plt.tight_layout()
 plt.show()
 ```
+
+El modelo no cambió — los scores son idénticos. Sin embargo el AUC-ROC **sube** a medida que aumenta el desbalance. Más negativos = más TN fáciles = FPR más bajo = curva más arriba.
 
 ### PR a distintos niveles de desbalance
 
@@ -389,10 +420,10 @@ plt.show()
 #| fig-height: 7
 fig, axes = plt.subplots(2, 2, figsize=(6.5, 7))
 
-for ax, (ratio, yte, proba_sim) in zip(axes.flat, sim_results):
-    prec, rec, _ = precision_recall_curve(yte, proba_sim)
-    ap = average_precision_score(yte, proba_sim)
-    baseline_sim = yte.mean()
+for ax, (ratio, y_sim, s_sim) in zip(axes.flat, sim_results):
+    prec, rec, _ = precision_recall_curve(y_sim, s_sim)
+    ap = average_precision_score(y_sim, s_sim)
+    baseline_sim = y_sim.mean()
     ax.plot(rec, prec, "#16A34A", lw=2.5)
     ax.axhline(baseline_sim, color="black", linestyle="--", lw=1.2)
     ax.fill_between(rec, 0, prec, alpha=0.15, color="#16A34A")
@@ -401,15 +432,42 @@ for ax, (ratio, yte, proba_sim) in zip(axes.flat, sim_results):
     ax.set_ylabel("Precisión", fontsize=9)
     ax.set_xlim([0, 1]); ax.set_ylim([0, 1.02])
 
-fig.suptitle("Curva PR — el AUC cae drásticamente y el baseline también se mueve", fontsize=10)
+fig.suptitle("Curva PR — el AUC cae y el baseline también: la dificultad queda expuesta", fontsize=10)
 plt.tight_layout()
 plt.show()
 ```
 
-A medida que el ratio de desbalance aumenta:
+La curva PR cuenta la historia correcta: el mismo modelo se vuelve más difícil de usar a medida que los positivos son más escasos, y eso se ve directamente en el AUC y en el baseline.
 
-- **ROC-AUC** permanece artificialmente alto (aparenta buen rendimiento porque el FPR usa los abundantes TN)
-- **PR-AUC** cae notablemente y su baseline también se desplaza hacia abajo, revelando cuánto cuesta detectar la clase rara
+### La divergencia en un solo gráfico
+
+```{python}
+#| fig-width: 6.5
+#| fig-height: 4
+auc_roc_vals = [roc_auc_score(y_s, s_s) for _, y_s, s_s in sim_results]
+auc_pr_vals  = [average_precision_score(y_s, s_s) for _, y_s, s_s in sim_results]
+
+fig, ax = plt.subplots(figsize=(6.5, 4))
+ax.plot(ratios, auc_roc_vals, "o-", color="#2563EB", lw=2.5, label="AUC-ROC")
+ax.plot(ratios, auc_pr_vals,  "o-", color="#16A34A", lw=2.5, label="AUC-PR")
+ax.set_xscale("log")
+ax.set_xticks(ratios); ax.set_xticklabels([f"{r}:1" for r in ratios])
+ax.set_xlabel("Ratio de desbalance (negativos:positivos)", fontsize=11)
+ax.set_ylabel("AUC", fontsize=11)
+ax.set_title("Mismo modelo, distinto desbalance — ROC sube, PR baja", fontsize=12)
+ax.legend(fontsize=10)
+ax.set_ylim([0, 1.05])
+plt.tight_layout()
+plt.show()
+```
+
+::: {.callout-important}
+**El mismo modelo. Los mismos scores. Solo más negativos.** AUC-ROC sube porque tiene más TN fáciles. AUC-PR baja porque la precisión se vuelve más difícil de mantener. Solo uno de los dos está contando la historia real.
+:::
+
+### ¿Entonces hay que abandonar la ROC?
+
+No. Si las clases están balanceadas, la ROC es excelente — mide exactamente lo que querés medir. Pero si la clase positiva es menor al 10% del total, la AUC-PR da una imagen más fiel porque mide lo que le importa al negocio: de todas las alertas que genera el modelo, ¿cuántas son reales?
 
 ---
 
@@ -533,10 +591,12 @@ plt.show()
 
 No hay una métrica universalmente correcta — depende del problema. Pero hay una regla práctica que sale directo de todo lo que vimos:
 
-- **AUC-ROC** — cuando las clases están balanceadas o el desbalance es leve. Es la métrica estándar, fácil de interpretar y ampliamente aceptada. Usala con confianza cuando los TN no son tan abundantes como para distorsionar el FPR.
+- **AUC-ROC** — cuando las clases están balanceadas o el desbalance es leve (menos de 10:1). Es la métrica estándar, fácil de interpretar y ampliamente aceptada. Usala con confianza cuando los TN no son tan abundantes como para distorsionar el FPR.
 
 - **AUC-PR** — cuando el desbalance es severo (más de 10:1). Es más honesta porque no se infla con la clase mayoritaria. Si trabajás con fraude, churn extremo, detección de enfermedades raras o cualquier problema donde los positivos son escasos, esta es tu métrica principal.
 
 - **F1** — cuando ya tenés que tomar una decisión concreta de umbral. AUC-ROC y AUC-PR resumen el modelo en todos los puntos de corte posibles, pero en producción siempre hay que elegir uno. El F1 en el umbral óptimo es el número que le mostrás al negocio.
 
-Si tenés dudas, calculá las tres. El problema aparece cuando solo mirás una y asumís que cuenta toda la historia.
+::: {.callout-important}
+Si tu ratio de desbalance es mayor a 10:1, la AUC-ROC está siendo optimista. Usá AUC-PR como métrica principal y F1 en el umbral óptimo como métrica de producción. Si tenés dudas, calculá las tres — el problema aparece cuando solo mirás una y asumís que cuenta toda la historia.
+:::
